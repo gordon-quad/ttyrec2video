@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+
+from PIL import Image,ImageFont,ImageDraw
+from subprocess import Popen, PIPE, DEVNULL
+import argparse
+import numpy as np
+import os
+import pyte
+import struct
+import sys
+import time
+
+font_normal = ImageFont.truetype("terminus.ttf", 16)
+font_bold = ImageFont.truetype("terminus-b.ttf", 16)
+font_bold_italics = ImageFont.truetype("terminus-bi.ttf", 16)
+font_italics = ImageFont.truetype("terminus-i.ttf", 16)
+
+char_width = 8
+char_height = 16
+
+ffmpeg = None
+
+def frames(fname):
+    script = open(fname, 'rb').read()
+    offset = 0
+    (delay, delayus, length) = struct.unpack('<III', script[offset:offset+12])
+    last_delay = delay + delayus / 1000000.0
+    while offset < len(script):
+        (delay, delayus, length) = struct.unpack('<III', script[offset:offset+12])
+        offset += 12
+        frame = script[offset:offset+length]
+        delay = delay + delayus / 1000000.0
+        delay, last_delay = delay - last_delay, delay
+        yield frame, delay
+        offset += length
+
+# classic VGA colors
+colors = {
+    'black':   (  0,   0,   0),
+    'red':     (170,   0,   0),
+    'green':   (  0, 170,   0),
+    'brown':   (170,  85,   0),
+    'yellow':  (170, 170,   0),
+    'blue':    (  0,   0, 170),
+    'magenta': (170,   0, 170),
+    'cyan':    (  0, 170, 170),
+    'gray':    (170, 170, 170),
+    'white':   (255, 255, 255)
+}
+
+def get_color(color):
+    try:
+        return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
+    except:
+        return colors[color] if color != 'default' else colors['black'] 
+
+def render(screen):
+    img = Image.new("RGB", (screen_width * char_width, screen_height * char_height), (0,0,0))
+    drw = ImageDraw.Draw(img)
+    for yc in screen.buffer:
+        for xc in screen.buffer[yc]:
+            ch = screen.buffer[yc][xc]
+            char = ch.data
+            fg = ch.fg
+            bg = ch.bg
+            bold = ch.bold
+            italics = ch.italics
+            if bold and italics:
+                font = font_bold_italics
+            elif bold:
+                font = font_bold
+            elif italics:
+                font = font_italics
+            else:
+                font = font_normal
+
+            c_bg = get_color(bg)
+            c_fg = get_color(fg)
+
+            x = xc * char_width
+            y = yc * char_height
+
+            drw.rectangle([(x, y), (x + char_width - 1, y + char_height - 1)], fill=c_bg)
+            drw.text((x,y), char, fill=c_fg, font=font)
+
+    return img
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Convert ttyrec files to video.')
+    parser.add_argument('-x', '--width', dest='width', action='store', type=int, default=80,
+                        help='Screen width to simulate')
+    parser.add_argument('-y', '--height', dest='height', action='store', type=int, default=25,
+                        help='Screen height to simulate')
+    parser.add_argument('-r', '--fps', dest='fps', action='store', type=int, default=30,
+                        help='Frames per second of output video')
+    parser.add_argument('-m', '--maxdelay', dest='maxdelay', action='store', type=float, default=None,
+                        help='Limit maximum delay between frames')
+    parser.add_argument('-s', '--speedup', dest='speedup', action='store', type=float, default=1.0,
+                        help='Run the ttyrec faster (1.0 = normal, 2.0 = twice as fast)')
+    parser.add_argument('-o', '--output', dest='output', action='store', type=str, default='video.mp4',
+                        help='Output file')
+    parser.add_argument('-c', '--codec', dest='codec', action='store', type=str, default='libx264',
+                        help='Codec to use')
+    parser.add_argument('-f', '--from', dest='fromtime', action='store', type=float, default=None,
+                        help='Start encoding from this time (seconds)')
+    parser.add_argument('-t', '--to', dest='totime', action='store', type=float, default=None,
+                        help='Stop encoding at this time (seconds)')
+    parser.add_argument('-q', '--quiet', dest='quiet', action='store_true', default=False,
+                        help='Stop encoding at this time (seconds)')
+    parser.add_argument('fname', metavar='ttyrecfile', help='A ttyrecfile')
+    args = parser.parse_args()
+
+    screen_width = args.width
+    screen_height = args.height
+    speedup = args.speedup
+    fps = args.fps
+    maxdelay = args.maxdelay
+    frame_duration = 1.0/fps
+    output = args.output
+    fromtime = args.fromtime
+    totime = args.totime
+    codec = args.codec
+    passthrough = DEVNULL if args.quiet else None
+
+    stream = pyte.ByteStream()
+    screen = pyte.Screen(screen_width, screen_height)
+    stream.attach(screen)
+
+    ffmpeg = Popen(['ffmpeg', '-y', '-f', 'image2pipe', '-r', str(fps), '-i', '-', '-c:v', codec, '-pix_fmt', 'yuv420p',
+                    '-preset', 'slower', '-r', str(fps), output], stdin=PIPE, stdout=passthrough, stderr=passthrough)
+
+    play_time = 0.0
+    rec_time = 0.0
+    running_time = 0.0
+    frame_start = time.time()
+
+    for i, (frame, delay) in enumerate(frames(args.fname)):
+        if delay < 0:
+            delay = 0
+        rec_time += delay
+        if maxdelay and (delay > maxdelay):
+            delay = maxdelay
+        if (not totime) or (totime > rec_time):
+            delay /= speedup
+            stream.feed(frame)
+            if fromtime and (fromtime > rec_time):
+                continue
+            play_time += delay
+            if play_time < running_time:
+                continue
+            im = render(screen)
+            im.save(ffmpeg.stdin, 'PNG')
+            running_time += frame_duration
+            while running_time < play_time:
+                im.save(ffmpeg.stdin, 'PNG')
+                running_time += frame_duration
+        frame_end = time.time()
+
+    ffmpeg.stdin.close()
+    ffmpeg.wait()
+
+    print("Original ttyrec time: %.3f seconds" % rec_time)
+    print("Ttyrec duration: %.3f seconds" % play_time)
+    print("Video duration: %.3f seconds" % running_time)
+    print("Frame rendering time: %.3f seconds, %.3f ms per frame" % (frame_end - frame_start, 1000.0 * (frame_end - frame_start) / float(i)))
